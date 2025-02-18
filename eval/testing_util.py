@@ -177,6 +177,16 @@ def run_test(problem=None, problem_list:List[str]=None, prob_index:int=None,
             signal.alarm(0)
 
         elif which_type == CODE_TYPE.standard_input:
+            # this construction does not work with the dynamic import
+            test = test.replace('__name__ == "__main__"', 'True')
+            test = test.replace("__name__ == '__main__'", 'True')
+            test = test.replace('__name__== "__main__"', 'True')
+            test = test.replace("__name__=='__main__'", 'True')
+            test = test.replace('__name__ =="__main__"', 'True')
+            test = test.replace("__name__ =='__main__'", 'True')
+            test = test.replace('__name__=="__main__"', 'True')
+            test = test.replace("__name__=='__main__'", 'True')
+
             # sol
             tmp_test = test.split("\n")
 
