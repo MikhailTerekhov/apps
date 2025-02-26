@@ -3,8 +3,13 @@ import json
 import os
 import sys
 import io
+import tempfile
 import faulthandler
 import platform
+from copy import deepcopy
+from contextlib import redirect_stdout, redirect_stderr
+import re
+import ctypes
 
 # used for debugging to time steps
 from datetime import datetime
@@ -12,7 +17,6 @@ from datetime import datetime
 # to run the solution files we're using a timing based approach
 import signal
 
-import numpy as np
 # for capturing the stdout
 from io import StringIO
 from typing import get_type_hints
@@ -119,13 +123,78 @@ def get_solutions(problem_list, prob_index):
     return sols
 
 
+def format_traceback(e:Exception, code:str):
+    # Custom traceback formatting to always show code context
+    tb = e.__traceback__
+    tb_list = []
+    while tb:
+        # Skipping the non-/tmp files (we don't want to show the traceback of the APPS tooling)
+        if tb.tb_frame.f_code.co_filename.startswith('/tmp'):
+            tb_list.append(tb)
+        tb = tb.tb_next
+    
+    # If traceback is more than 6 levels, show first 3 and last 3
+    if len(tb_list) > 6:
+        tb_to_show = tb_list[:3] + tb_list[-3:]
+        # Add a separator between first 3 and last 3
+        show_separator = True
+    else:
+        tb_to_show = tb_list
+        show_separator = False
+    
+    lines = code.splitlines()
+
+    result = []
+    if isinstance(e, SyntaxError):
+        # print(e.filename, file=sys.stderr)
+        # Special handling for syntax errors
+        if hasattr(e, 'lineno') and hasattr(e, 'offset'):
+            lineno = e.lineno
+            if lineno is not None:  # Check if lineno is not None
+                # Get up to 3 lines before and after the error
+                start_line = max(1, lineno - 3)
+                end_line = min(len(lines), lineno + 3)
+                
+                # Replace the filename in the error message with 'code.py'
+                error_msg = str(e)
+                if hasattr(e, 'filename') and e.filename:
+                    error_msg = error_msg.replace(e.filename.split("/")[-1], 'code.py')
+                
+                result.append(f"{type(e).__name__}: {error_msg}")
+                result.append(f"Error occurred at line {lineno}, position {e.offset}")
+                result.append("")
+                
+                # Show the code context with line numbers
+                for i in range(start_line, end_line + 1):
+                    prefix = "> " if i == lineno else "  "
+                    line_content = lines[i-1] if 0 < i <= len(lines) else ""
+                    result.append(f"{prefix}{i}: {line_content}")
+                
+                result.append("")  # Empty line after context
+                return "\n".join(result)
+    
+    # Format the exception header
+    result.append(f"{type(e).__name__}: {str(e)}")
+    result.append("")  # Empty line after exception header
+    
+    for i, tb in enumerate(tb_to_show):
+        if show_separator and i == 3:
+            result.append(f"  ... {len(tb_list) - 6} frames omitted ...")
+        lineno = tb.tb_lineno
+        line = lines[lineno-1].strip() if 0 < lineno <= len(lines) else ""
+        # No need to show the actual filename
+        result.append(f"  File 'code.py', line {lineno}")
+        result.append(f"    {line}")
+    
+    return "\n".join(result)
+
+
 def run_test(problem=None, problem_list:List[str]=None, prob_index:int=None, 
-        test:str=None, debug:bool=False):
+        test:str=None, debug:bool=False, return_outputs:bool=False):
     """
     if test is not None it'll try to run the code.
     otherwise it'll just return an input and output pair.
     """
-
     if debug:
         print(f"start = {datetime.now().time()}")
 
@@ -149,11 +218,22 @@ def run_test(problem=None, problem_list:List[str]=None, prob_index:int=None,
     if test is None:
         return in_outs
     elif test is not None:
+        has_numpy = re.search(r'(?:^|\W)np\.', test)
+        # Numpy is very heavy! Import only if used
+        if has_numpy:
+            import numpy as np
+
         # Disable functionalities that can make destructive changes to the test.
+        # This would also make it impossible to import numpy afterwards
         reliability_guard()
         
         results = []
-        sol = "import sys\nimport time\nimport itertools\nfrom itertools import accumulate, product, permutations, combinations\nimport collections\nfrom collections import Counter, OrderedDict, deque, defaultdict, ChainMap\nfrom functools import lru_cache\nimport math\nfrom math import sqrt, sin, cos, tan, ceil, fabs, floor, gcd, exp, log, log2\nimport fractions\nfrom typing import List, Tuple\nimport numpy as np\nimport random\nimport heapq\nfrom heapq import *\n"
+        outputs = []
+        sol = "import sys\nimport time\nimport itertools\nfrom itertools import accumulate, product, permutations, combinations\nimport collections\nfrom collections import Counter, OrderedDict, deque, defaultdict, ChainMap\nfrom functools import lru_cache\nimport math\nfrom math import sqrt, sin, cos, tan, ceil, fabs, floor, gcd, exp, log, log2\nimport fractions\nfrom typing import List, Tuple\nimport random\nimport heapq\nfrom heapq import *\n"
+
+        if has_numpy:
+            sol += "import numpy as np\n"
+
         if debug:
             print(f"loading test code = {datetime.now().time()}")
  
@@ -162,18 +242,41 @@ def run_test(problem=None, problem_list:List[str]=None, prob_index:int=None,
             if debug: # or True:
                 print(f"sol = {sol}")
             signal.alarm(timeout)
+            # Create a temporary file instead of loading directly from string
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, dir='/tmp') as f:
+                f.write(sol)
+                temp_filename = f.name
             try:
-                tmp_sol = RuntimeModule.from_string("tmp_sol", "", sol)
+                # Import the module from the temporary file
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("tmp_sol", temp_filename)
+                assert spec is not None
+                assert spec.loader is not None
+                tmp_sol = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(tmp_sol)
                 if "class Solution" not in test:
                     tmp = tmp_sol
                 else:
                     tmp = tmp_sol.Solution()
+                
                 signal.alarm(0)
             except Exception as e:
                 signal.alarm(0)
-                print(f"type 0 compilation error = {e}")
+                stderr = format_traceback(e, sol)
+                print(f"type 0 compilation error")
+                print(stderr)
                 results.append(-2)
-                return results
+                if return_outputs:
+                    outputs.append({"fn_output": None, "stdout": "", "stderr": stderr})
+                    return results, outputs
+                else:
+                    return results
+            finally:
+                # Clean up the temporary file if it exists
+                # Working around the guard is not that hard lol (suggested by Claude!)
+                libc = ctypes.CDLL("libc.so.6")
+                libc.unlink(temp_filename.encode())
+                
             signal.alarm(0)
 
         elif which_type == CODE_TYPE.standard_input:
@@ -218,27 +321,56 @@ def run_test(problem=None, problem_list:List[str]=None, prob_index:int=None,
                 # print(f"{o}") 
             method_name = "code"
             signal.alarm(timeout)
+            # Create a temporary file instead of loading directly from string
+            # We can't use the default dir because os.getcwd is disabled by the guard
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, dir='/tmp') as f:
+                f.write(sol)
+                temp_filename = f.name
             try:
-                tmp_sol = RuntimeModule.from_string("tmp_sol", "", sol)
+                # Use imp or importlib to load from the actual file
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("tmp_sol", temp_filename)
+                assert spec is not None
+                assert spec.loader is not None
+                tmp_sol = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(tmp_sol)
+                
                 tmp = tmp_sol
                 signal.alarm(0)
             except Exception as e:
                 signal.alarm(0)
-                print(f"type 1 compilation error = {e}")
                 results.append(-2)
-                return results
+                stderr = format_traceback(e, sol)
+                print("type 1 compilation error:")
+                print(stderr)
+                if return_outputs:
+                    outputs.append({"stdout": "", "stderr": stderr})
+                    return results, outputs
+                else:
+                    return results
+            finally:
+                # Clean up the temporary file
+                # Working around the guard is not that hard lol (suggested by Claude!)
+                libc = ctypes.CDLL("libc.so.6")
+                libc.unlink(temp_filename.encode())
             signal.alarm(0)
         if debug:
             print(f"get method = {datetime.now().time()}")
  
         try:
             method = getattr(tmp, method_name)  # get_attr second arg must be str
-        except:
+        except Exception as ee:
             signal.alarm(0)
             e = sys.exc_info()
             print(f"unable to get function error = {e}")
             results.append(-2)
-            return results
+            stderr = format_traceback(ee, sol)
+            print(stderr)
+            if return_outputs:
+                outputs.append({"stdout": "", "stderr": stderr})
+                return results, outputs
+            else:
+                return results
 
         for index, inputs in enumerate(in_outs["inputs"]):
             # JSON forces dictionaries to have string keys; this undoes this (assuming a singleton list)
@@ -263,35 +395,43 @@ def run_test(problem=None, problem_list:List[str]=None, prob_index:int=None,
             if which_type == CODE_TYPE.call_based:  # Call-based
                 signal.alarm(timeout)
                 faulthandler.enable()
-                try:
-                    # print("------------")
-                    # print(inputs)
-                    output = method(*inputs)
-
-                    # ground truth sequences are not tuples
-                    if isinstance(output, tuple):
-                        output = list(output)
-                    
-                    tmp_result = output == in_outs["outputs"][index]
-                    if isinstance(in_outs["outputs"][index], list) and in_outs["outputs"][index]:
-                        tmp_result = tmp_result or (output == in_outs["outputs"][index][0])
-
-                    # ground truth sequences are not tuples
+                stdout_capture = StringIO()
+                stderr_capture = StringIO()
+                output = None
+                
+                with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
                     try:
-                        if isinstance(output[0], tuple):
-                            tmp_result = tmp_result or ([list(x) for x in output] == in_outs["outputs"][index][0])
-                    except:
-                        True
-                    results.append(tmp_result)
+                        # print("------------")
+                        # print(inputs)
+                        output = method(*inputs)
+                        
+                        # ground truth sequences are not tuples
+                        if isinstance(output, tuple):
+                            output = list(output)
+                        
+                        tmp_result = output == in_outs["outputs"][index]
+                        if isinstance(in_outs["outputs"][index], list) and in_outs["outputs"][index]:
+                            tmp_result = tmp_result or (output == in_outs["outputs"][index][0])
 
-                    # reset the alarm
-                    signal.alarm(0)
-                except Exception as e:
-                    signal.alarm(0)
-                    faulthandler.disable()
-                    print(f"Standard input runtime error or time limit exceeded error = {e}")
-                    results.append(-1)
-                    continue
+                        # ground truth sequences are not tuples
+                        try:
+                            if isinstance(output[0], tuple):
+                                tmp_result = tmp_result or ([list(x) for x in output] == in_outs["outputs"][index][0])
+                        except:
+                            True
+                        results.append(tmp_result)
+                        outputs.append({"fn_output": deepcopy(output), "stdout": stdout_capture.getvalue(), "stderr": stderr_capture.getvalue()})
+
+                        # reset the alarm
+                        signal.alarm(0)
+                    except Exception as e:
+                        signal.alarm(0)
+                        faulthandler.disable()
+                        err_msg = "Standard input runtime error or time limit exceeded error:\n" + format_traceback(e, sol)
+                        print(err_msg, file=sys.stderr)
+                        results.append(-1)
+                        outputs.append({"fn_output": None, "stdout": stdout_capture.getvalue(), "stderr": stderr_capture.getvalue()})
+                        continue
                 faulthandler.disable()
                 signal.alarm(0)
                 if debug:
@@ -306,7 +446,9 @@ def run_test(problem=None, problem_list:List[str]=None, prob_index:int=None,
                 if isinstance(in_outs['outputs'][index], list):
                     in_outs['outputs'][index] = "\n".join(in_outs['outputs'][index])
 
-                with Capturing() as output:
+                stdout_buffer = StringIO()
+                stderr_buffer = StringIO()
+                with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
                     try:
                         call_method(method, inputs)
                         # reset the alarm
@@ -315,11 +457,15 @@ def run_test(problem=None, problem_list:List[str]=None, prob_index:int=None,
                     except Exception as e:
                         # runtime error or took too long
                         signal.alarm(0)
-                        print(f"Call-based runtime error or time limit exceeded error = {repr(e)}{e}")
-                        results.append(-1)
+                        print("Runtime error or time limit exceeded error:\n", file=sys.stderr)
+                        print(format_traceback(e, sol), file=sys.stderr)
                     signal.alarm(0)
+                output_saved = {"stdout": stdout_buffer.getvalue(), "stderr": stderr_buffer.getvalue()}
+                output = stdout_buffer.getvalue().splitlines()
 
                 if not passed:
+                    results.append(-1)
+                    outputs.append(output_saved)
                     if debug:
                         nl = "\n"
                         if not isinstance(inputs, list):
@@ -334,6 +480,7 @@ def run_test(problem=None, problem_list:List[str]=None, prob_index:int=None,
                 if custom_compare_(output, in_outs['outputs'][index]):
                     tmp_result = True
                     results.append(tmp_result)
+                    outputs.append(output_saved)
                     continue
 
                 # ground truth sequences are expressed as lists not tuples
@@ -353,6 +500,7 @@ def run_test(problem=None, problem_list:List[str]=None, prob_index:int=None,
 
                 if tmp_result == True:  
                     results.append(tmp_result)
+                    outputs.append(output_saved)
                     continue
 
                 # try one more time without \n
@@ -375,6 +523,7 @@ def run_test(problem=None, problem_list:List[str]=None, prob_index:int=None,
 
                 if tmp_result == True:
                     results.append(tmp_result)
+                    outputs.append(output_saved)
                     continue
 
                 # try by converting the output into a split up list too
@@ -390,6 +539,7 @@ def run_test(problem=None, problem_list:List[str]=None, prob_index:int=None,
                 
                 if tmp_result == True:
                     results.append(tmp_result)
+                    outputs.append(output_saved)
                     continue
 
                 try:
@@ -416,6 +566,7 @@ def run_test(problem=None, problem_list:List[str]=None, prob_index:int=None,
 
                 if tmp_result == True:
                     results.append(tmp_result)
+                    outputs.append(output_saved)
                     continue
 
                 # try by converting the stuff into split up list
@@ -433,6 +584,7 @@ def run_test(problem=None, problem_list:List[str]=None, prob_index:int=None,
 
                 if tmp_result == True:
                     results.append(tmp_result)
+                    outputs.append(output_saved)
                     continue 
 
                 # try by converting the output into a split up list too
@@ -464,6 +616,7 @@ def run_test(problem=None, problem_list:List[str]=None, prob_index:int=None,
                     print("PASSED")
  
                 results.append(tmp_result)
+                outputs.append(output_saved)
                 
                 if debug:
                     nl = "\n"
@@ -472,8 +625,10 @@ def run_test(problem=None, problem_list:List[str]=None, prob_index:int=None,
                     else:
                         print(f"output = {output}, test outputs = {in_outs['outputs'][index]}, inputs = {inputs}, {type(inputs)}, {output == [in_outs['outputs'][index]]}") 
 
-
-    return results
+    if return_outputs:
+        return results, outputs
+    else:
+        return results
 
 def custom_compare_(output, ground_truth):
     
