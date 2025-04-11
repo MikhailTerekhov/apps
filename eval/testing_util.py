@@ -19,14 +19,13 @@ import signal
 
 # for capturing the stdout
 from io import StringIO
-from typing import get_type_hints
-from typing import List, Tuple
+from typing import List
 # used for testing the code that reads from input
 from unittest.mock import patch, mock_open
 
-from pyext import RuntimeModule
-
 from enum import Enum
+
+
 class CODE_TYPE(Enum):
     call_based = 0
     standard_input = 1
